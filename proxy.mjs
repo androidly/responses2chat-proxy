@@ -4,6 +4,7 @@ import https from 'node:https';
 const PORT = process.env.PORT || 3088;
 const MAX_IDLE_MS = 120_000;
 const REQUEST_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 90_000);
+const SSE_KEEPALIVE_MS = 15_000; // send SSE comment every 15s to keep connection alive
 const ALLOWED_UPSTREAM_HOSTS = new Set(
   String(process.env.ALLOWED_UPSTREAM_HOSTS || 'api.infiniteai.cc')
     .split(',')
@@ -332,6 +333,11 @@ function convertStreamChunk(line, state) {
     case 'response.content_part.done':
       break;
 
+    // --- Lifecycle events: emit SSE comments to keep stream alive ---
+    case 'response.created':
+    case 'response.in_progress':
+      return ': upstream ' + event.type + '\n\n';
+
     // --- Function/tool calls ---
     case 'response.output_item.added': {
       if (event.item?.type === 'function_call') {
@@ -485,7 +491,11 @@ function convertStreamChunk(line, state) {
     }
 
     default:
-      if (event.type) console.log(`[STREAM] unhandled: ${event.type}`);
+      if (event.type) {
+        console.log(`[STREAM] unhandled: ${event.type}`);
+        // Still emit SSE comment so client knows stream is alive
+        return ': unhandled ' + event.type + '\n\n';
+      }
       break;
   }
 
@@ -751,16 +761,32 @@ async function handleRequest(req, res) {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
       });
+      // Disable Node.js response buffering for immediate flush
+      res.socket?.setNoDelay?.(true);
+      res.flushHeaders();
 
       const state = createStreamState(body.model);
       let buffer = '';
       let lastData = Date.now();
+      let lastClientWrite = Date.now();
+
+      // Keep-alive: send SSE comment periodically so client knows we're alive
+      const keepAlive = setInterval(() => {
+        if (Date.now() - lastClientWrite > SSE_KEEPALIVE_MS) {
+          try {
+            res.write(': keepalive\n\n');
+            lastClientWrite = Date.now();
+          } catch {}
+        }
+      }, SSE_KEEPALIVE_MS);
 
       const idleCheck = setInterval(() => {
         if (Date.now() - lastData > MAX_IDLE_MS) {
           console.warn(`[STREAM-TIMEOUT] No data for ${MAX_IDLE_MS / 1000}s, force closing`);
           clearInterval(idleCheck);
+          clearInterval(keepAlive);
           if (!state.finished) {
             state.finished = true;
             const fr = state.toolCalls.length > 0 ? 'tool_calls' : 'stop';
@@ -781,13 +807,14 @@ async function handleRequest(req, res) {
           if (!trimmed) continue;
           const converted = convertStreamChunk(trimmed, state);
           if (converted) {
-            try { res.write(converted); } catch {}
+            try { res.write(converted); lastClientWrite = Date.now(); } catch {}
           }
         }
       });
 
       upRes.on('end', () => {
         clearInterval(idleCheck);
+        clearInterval(keepAlive);
         if (buffer.trim()) {
           const converted = convertStreamChunk(buffer.trim(), state);
           if (converted) try { res.write(converted); } catch {}
@@ -803,6 +830,7 @@ async function handleRequest(req, res) {
 
       upRes.on('error', (err) => {
         clearInterval(idleCheck);
+        clearInterval(keepAlive);
         console.error(`[STREAM-ERR] ${err.message}`);
         if (!state.finished) {
           state.finished = true;
