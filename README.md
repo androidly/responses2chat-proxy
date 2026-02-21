@@ -1,5 +1,7 @@
 # responses2chat-proxy
 
+[English](./README.md) | [简体中文](./README.zh-CN.md)
+
 A lightweight Node.js proxy that bridges **OpenAI Chat Completions** requests to upstream **Responses API** style providers, with strong compatibility for:
 
 - multi-turn tool calls
