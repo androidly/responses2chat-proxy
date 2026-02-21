@@ -21,6 +21,40 @@ function toToolArgsString(args) {
   try { return JSON.stringify(args); } catch { return String(args); }
 }
 
+function extractOutputTextFromContent(content) {
+  if (!Array.isArray(content)) return '';
+  let out = '';
+  for (const c of content) {
+    if (!c || typeof c !== 'object') continue;
+    if ((c.type === 'output_text' || c.type === 'text') && typeof c.text === 'string') {
+      out += c.text;
+    }
+  }
+  return out;
+}
+
+function extractReasoningTextFromContent(content) {
+  if (!Array.isArray(content)) return '';
+  let out = '';
+  for (const c of content) {
+    if (!c || typeof c !== 'object') continue;
+    if ((c.type === 'reasoning_text' || c.type === 'text') && typeof c.text === 'string') {
+      out += c.text;
+    }
+  }
+  return out;
+}
+
+function extractPartText(part) {
+  if (!part || typeof part !== 'object') return '';
+  if (typeof part.text === 'string') return part.text;
+  if (typeof part.delta === 'string') return part.delta;
+  if (Array.isArray(part.content)) {
+    return extractOutputTextFromContent(part.content) || extractReasoningTextFromContent(part.content);
+  }
+  return '';
+}
+
 // --- Conversion: Chat Completions request → Responses API request ---
 function completionsToResponses(body) {
   const resp = { model: body.model, input: [], store: false };
@@ -141,9 +175,7 @@ function responsesToCompletions(respBody, model) {
   if (Array.isArray(respBody.output)) {
     for (const item of respBody.output) {
       if (item.type === 'message') {
-        for (const c of (Array.isArray(item.content) ? item.content : [])) {
-          if (c.type === 'output_text') outputContent += c.text;
-        }
+        outputContent += extractOutputTextFromContent(item.content);
       } else if (item.type === 'function_call') {
         toolCalls.push({
           id: item.call_id || item.id || makeId('call'),
@@ -155,11 +187,8 @@ function responsesToCompletions(respBody, model) {
         });
         finishReason = 'tool_calls';
       } else if (item.type === 'reasoning') {
-        for (const c of (Array.isArray(item.content) ? item.content : [])) {
-          if (c.type === 'reasoning_text') {
-            reasoningContent = (reasoningContent || '') + c.text;
-          }
-        }
+        const t = extractReasoningTextFromContent(item.content);
+        if (t) reasoningContent = (reasoningContent || '') + t;
       }
     }
   }
@@ -262,6 +291,19 @@ function convertStreamChunk(line, state) {
     case 'response.reasoning_summary_text.done':
       break;
 
+    case 'response.reasoning_summary_part.added': {
+      const t = extractPartText(event.part);
+      if (t) {
+        state.hasReasoning = true;
+        ensureRoleChunk(state, out);
+        out.push(makeChunk(state, { reasoning_content: t }));
+      }
+      break;
+    }
+
+    case 'response.reasoning_summary_part.done':
+      break;
+
     // --- Text output ---
     case 'response.output_text.delta': {
       if (!state.hasContent) {
@@ -273,6 +315,21 @@ function convertStreamChunk(line, state) {
     }
 
     case 'response.output_text.done':
+      break;
+
+    case 'response.content_part.added': {
+      const t = extractPartText(event.part);
+      if (t) {
+        if (!state.hasContent) {
+          state.hasContent = true;
+          ensureRoleChunk(state, out);
+        }
+        out.push(makeChunk(state, { content: t }));
+      }
+      break;
+    }
+
+    case 'response.content_part.done':
       break;
 
     // --- Function/tool calls ---
@@ -292,6 +349,61 @@ function convertStreamChunk(line, state) {
         if (tc.call_id) state.toolCallByCallId.set(tc.call_id, tc);
         if (tc.item_id) state.toolCallByItemId.set(tc.item_id, tc);
         console.log(`[STREAM] tool_call added: idx=${idx} name=${tc.name} id=${tc.id}`);
+      }
+      break;
+    }
+
+    case 'response.output_item.done': {
+      const item = event.item;
+      if (!item || typeof item !== 'object') break;
+
+      if (item.type === 'message' && !state.hasContent) {
+        const t = extractOutputTextFromContent(item.content);
+        if (t) {
+          state.hasContent = true;
+          ensureRoleChunk(state, out);
+          out.push(makeChunk(state, { content: t }));
+        }
+      }
+
+      if (item.type === 'reasoning') {
+        const t = extractReasoningTextFromContent(item.content);
+        if (t) {
+          state.hasReasoning = true;
+          ensureRoleChunk(state, out);
+          out.push(makeChunk(state, { reasoning_content: t }));
+        }
+      }
+
+      if (item.type === 'function_call') {
+        let tc = getToolByEvent(state, { call_id: item.call_id, item_id: item.id });
+        if (!tc) {
+          const idx = state.toolCalls.length;
+          tc = {
+            index: idx,
+            id: item.call_id || item.id || makeId('call'),
+            call_id: item.call_id || null,
+            item_id: item.id || null,
+            name: item.name || '',
+            started: false,
+          };
+          state.toolCalls.push(tc);
+          state.currentToolIndex = idx;
+          if (tc.call_id) state.toolCallByCallId.set(tc.call_id, tc);
+          if (tc.item_id) state.toolCallByItemId.set(tc.item_id, tc);
+        }
+        if (!tc.started) {
+          tc.started = true;
+          ensureRoleChunk(state, out);
+          out.push(makeChunk(state, {
+            tool_calls: [{
+              index: tc.index,
+              id: tc.id,
+              type: 'function',
+              function: { name: tc.name, arguments: toToolArgsString(item.arguments) },
+            }],
+          }));
+        }
       }
       break;
     }
@@ -452,9 +564,15 @@ function assembleSSE(rawResp, requestModel) {
       case 'response.output_text.delta':
         fullText += ev.delta || '';
         break;
+      case 'response.content_part.added':
+        fullText += extractPartText(ev.part);
+        break;
       case 'response.reasoning.delta':
       case 'response.reasoning_summary_text.delta':
         reasoningText += ev.delta || '';
+        break;
+      case 'response.reasoning_summary_part.added':
+        reasoningText += extractPartText(ev.part);
         break;
       case 'response.output_item.added':
         if (ev.item?.type === 'function_call') {
@@ -487,9 +605,9 @@ function assembleSSE(rawResp, requestModel) {
           if (Array.isArray(ev.response.output)) {
             for (const item of ev.response.output) {
               if (item.type === 'message') {
-                for (const c of (Array.isArray(item.content) ? item.content : [])) {
-                  if (c.type === 'output_text' && !fullText) fullText += c.text;
-                }
+                if (!fullText) fullText += extractOutputTextFromContent(item.content);
+              } else if (item.type === 'reasoning') {
+                reasoningText += extractReasoningTextFromContent(item.content);
               } else if (item.type === 'function_call') {
                 const key = item.call_id || item.id || makeId('call');
                 if (!tcMap.has(key)) {
@@ -505,9 +623,9 @@ function assembleSSE(rawResp, requestModel) {
         if (Array.isArray(ev.output)) {
           for (const item of ev.output) {
             if (item.type === 'message') {
-              for (const c of (Array.isArray(item.content) ? item.content : [])) {
-                if (c.type === 'output_text') fullText += c.text;
-              }
+              fullText += extractOutputTextFromContent(item.content);
+            } else if (item.type === 'reasoning') {
+              reasoningText += extractReasoningTextFromContent(item.content);
             }
           }
         }
