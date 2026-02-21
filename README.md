@@ -1,4 +1,4 @@
-# completions-proxy
+# responses2chat-proxy
 
 A lightweight Node.js proxy that bridges **OpenAI Chat Completions** requests to upstream **Responses API** style providers, with strong compatibility for:
 

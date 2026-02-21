@@ -1,4 +1,4 @@
-# completions-proxy 生产运行建议
+# responses2chat-proxy 生产运行建议
 
 ## 1) 环境变量（推荐）
 
