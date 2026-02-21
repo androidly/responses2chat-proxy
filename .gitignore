@@ -1,0 +1,20 @@
+# logs
+*.log
+
+# runtime
+*.pid
+
+# env
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+
+# misc
+coverage/
