@@ -185,6 +185,8 @@ function createStreamState(model) {
     model,
     toolCalls: [],
     currentToolIndex: -1,
+    toolCallByCallId: new Map(),
+    toolCallByItemId: new Map(),
     hasContent: false,
     hasReasoning: false,
     sentRole: false,
@@ -207,6 +209,19 @@ function ensureRoleChunk(state, out) {
     state.sentRole = true;
     out.push(makeChunk(state, { role: 'assistant', content: '' }));
   }
+}
+
+function getToolByEvent(state, event) {
+  if (event.call_id && state.toolCallByCallId.has(event.call_id)) {
+    return state.toolCallByCallId.get(event.call_id);
+  }
+  if (event.item_id && state.toolCallByItemId.has(event.item_id)) {
+    return state.toolCallByItemId.get(event.item_id);
+  }
+  if (state.currentToolIndex >= 0 && state.toolCalls[state.currentToolIndex]) {
+    return state.toolCalls[state.currentToolIndex];
+  }
+  return null;
 }
 
 // --- Streaming conversion ---
@@ -260,34 +275,44 @@ function convertStreamChunk(line, state) {
         const tc = {
           index: idx,
           id: event.item.call_id || event.item.id || makeId('call'),
+          call_id: event.item.call_id || null,
+          item_id: event.item.id || null,
           name: event.item.name || '',
           started: false,
         };
         state.toolCalls.push(tc);
         state.currentToolIndex = idx;
+        if (tc.call_id) state.toolCallByCallId.set(tc.call_id, tc);
+        if (tc.item_id) state.toolCallByItemId.set(tc.item_id, tc);
         console.log(`[STREAM] tool_call added: idx=${idx} name=${tc.name} id=${tc.id}`);
       }
       break;
     }
 
     case 'response.function_call_arguments.delta': {
-      let tc = state.toolCalls[state.currentToolIndex];
+      let tc = getToolByEvent(state, event);
       if (!tc) {
         const idx = state.toolCalls.length;
         tc = {
           index: idx,
           id: event.call_id || event.item_id || makeId('call'),
+          call_id: event.call_id || null,
+          item_id: event.item_id || null,
           name: event.name || '',
           started: false,
         };
         state.toolCalls.push(tc);
         state.currentToolIndex = idx;
+        if (tc.call_id) state.toolCallByCallId.set(tc.call_id, tc);
+        if (tc.item_id) state.toolCallByItemId.set(tc.item_id, tc);
+      } else {
+        state.currentToolIndex = tc.index;
       }
 
       if (!tc.started) {
         tc.started = true;
+        ensureRoleChunk(state, out);
         out.push(makeChunk(state, {
-          role: 'assistant',
           tool_calls: [{
             index: tc.index, id: tc.id, type: 'function',
             function: { name: tc.name, arguments: '' },
@@ -304,18 +329,18 @@ function convertStreamChunk(line, state) {
     }
 
     case 'response.function_call_arguments.done': {
-      const tc = state.toolCalls[state.currentToolIndex];
+      const tc = getToolByEvent(state, event);
       if (tc && !tc.started) {
         tc.started = true;
+        ensureRoleChunk(state, out);
         out.push(makeChunk(state, {
-          role: 'assistant',
           tool_calls: [{
             index: tc.index, id: tc.id, type: 'function',
-            function: { name: tc.name, arguments: event.arguments || '' },
+            function: { name: tc.name, arguments: toToolArgsString(event.arguments) },
           }],
         }));
       }
-      console.log(`[STREAM] tool_call args done: idx=${state.currentToolIndex}`);
+      console.log(`[STREAM] tool_call args done: idx=${tc ? tc.index : state.currentToolIndex}`);
       break;
     }
 
@@ -379,9 +404,9 @@ function assembleSSE(rawResp, requestModel) {
   let respId = '';
   let respModel = requestModel;
   let usage = null;
-  const tcMap = new Map();
+  const tcMap = new Map(); // key: call_id or fallback id, val: { id, name, args }
+  const itemToCall = new Map();
   const tcOrder = [];
-  let curCallId = '';
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -401,19 +426,24 @@ function assembleSSE(rawResp, requestModel) {
         break;
       case 'response.output_item.added':
         if (ev.item?.type === 'function_call') {
-          curCallId = ev.item.call_id || ev.item.id || makeId('call');
-          tcMap.set(curCallId, { name: ev.item.name || '', args: '' });
-          tcOrder.push(curCallId);
+          const key = ev.item.call_id || ev.item.id || makeId('call');
+          if (!tcMap.has(key)) {
+            tcMap.set(key, { id: key, name: ev.item.name || '', args: '' });
+            tcOrder.push(key);
+          }
+          if (ev.item.id) itemToCall.set(ev.item.id, key);
         }
         break;
       case 'response.function_call_arguments.delta': {
-        const tc = tcMap.get(curCallId);
+        const key = ev.call_id || itemToCall.get(ev.item_id) || null;
+        const tc = key ? tcMap.get(key) : null;
         if (tc) tc.args += ev.delta || '';
         break;
       }
       case 'response.function_call_arguments.done': {
-        const tc = tcMap.get(curCallId);
-        if (tc && ev.arguments) tc.args = ev.arguments;
+        const key = ev.call_id || itemToCall.get(ev.item_id) || null;
+        const tc = key ? tcMap.get(key) : null;
+        if (tc && ev.arguments != null) tc.args = toToolArgsString(ev.arguments);
         break;
       }
       case 'response.completed':
@@ -422,26 +452,28 @@ function assembleSSE(rawResp, requestModel) {
           respId = ev.response.id || respId;
           respModel = ev.response.model || respModel;
           usage = ev.response.usage || usage;
-          if (ev.response.output) {
+          if (Array.isArray(ev.response.output)) {
             for (const item of ev.response.output) {
               if (item.type === 'message') {
-                for (const c of (item.content || [])) {
+                for (const c of (Array.isArray(item.content) ? item.content : [])) {
                   if (c.type === 'output_text' && !fullText) fullText += c.text;
                 }
-              } else if (item.type === 'function_call' && !tcMap.has(item.call_id)) {
-                const cid = item.call_id || item.id;
-                tcMap.set(cid, { name: item.name || '', args: item.arguments || '' });
-                tcOrder.push(cid);
+              } else if (item.type === 'function_call') {
+                const key = item.call_id || item.id || makeId('call');
+                if (!tcMap.has(key)) {
+                  tcMap.set(key, { id: key, name: item.name || '', args: toToolArgsString(item.arguments) });
+                  tcOrder.push(key);
+                }
               }
             }
           }
         }
         break;
       default:
-        if (ev.output) {
+        if (Array.isArray(ev.output)) {
           for (const item of ev.output) {
             if (item.type === 'message') {
-              for (const c of (item.content || [])) {
+              for (const c of (Array.isArray(item.content) ? item.content : [])) {
                 if (c.type === 'output_text') fullText += c.text;
               }
             }
@@ -451,9 +483,9 @@ function assembleSSE(rawResp, requestModel) {
     }
   }
 
-  const toolCalls = tcOrder.map(cid => {
-    const tc = tcMap.get(cid);
-    return { id: cid, type: 'function', function: { name: tc.name, arguments: tc.args } };
+  const toolCalls = tcOrder.map(key => {
+    const tc = tcMap.get(key);
+    return { id: tc.id || makeId('call'), type: 'function', function: { name: tc.name || '', arguments: toToolArgsString(tc.args) } };
   });
 
   const fr = toolCalls.length > 0 ? 'tool_calls' : 'stop';
@@ -464,12 +496,12 @@ function assembleSSE(rawResp, requestModel) {
   console.log(`[OK] SSE→JSON: text=${fullText.length} reasoning=${reasoningText.length} tools=${toolCalls.length}`);
 
   return {
-    id: respId || 'chatcmpl-proxy-' + Date.now(),
+    id: respId || makeId('chatcmpl-proxy'),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model: respModel,
     choices: [{ index: 0, message, finish_reason: fr }],
-    usage: usage ? {
+    usage: (usage && typeof usage === 'object') ? {
       prompt_tokens: usage.input_tokens || 0,
       completion_tokens: usage.output_tokens || 0,
       total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
@@ -515,11 +547,17 @@ async function handleRequest(req, res) {
   console.log(`[${ts}] ${upstream} model=${body.model} stream=${!!isStream} tools=${toolCount} msgs=${msgCount} toolResults=${hasToolResults}`);
 
   try {
+    const upstreamAuth = req.headers['authorization'];
+    if (!upstreamAuth) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'Missing Authorization header' } }));
+    }
+
     const upRes = await makeRequest(upstreamUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': req.headers['authorization'] || '',
+        'Authorization': upstreamAuth,
         'Content-Length': Buffer.byteLength(responsesJson),
       },
     }, responsesJson);
