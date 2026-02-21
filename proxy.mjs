@@ -3,6 +3,13 @@ import https from 'node:https';
 
 const PORT = process.env.PORT || 3088;
 const MAX_IDLE_MS = 120_000;
+const REQUEST_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 90_000);
+const ALLOWED_UPSTREAM_HOSTS = new Set(
+  String(process.env.ALLOWED_UPSTREAM_HOSTS || 'api.infiniteai.cc')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 function makeId(prefix = 'id') {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -378,11 +385,31 @@ function convertStreamChunk(line, state) {
 function parseUpstream(url) {
   const path = url.split('?')[0];
   const match = path.match(/^\/(https?:\/\/.+?)\/(?:v1\/)?chat\/completions$/);
-  if (match) return { upstream: match[1], ok: true };
   const decoded = decodeURIComponent(path);
   const match2 = decoded.match(/^\/(https?:\/\/.+?)\/(?:v1\/)?chat\/completions$/);
-  if (match2) return { upstream: match2[1], ok: true };
-  return { upstream: null, ok: false };
+
+  const rawUpstream = match?.[1] || match2?.[1] || null;
+  if (!rawUpstream) return { upstream: null, ok: false, reason: 'path_mismatch' };
+
+  let parsed;
+  try {
+    parsed = new URL(rawUpstream);
+  } catch {
+    return { upstream: null, ok: false, reason: 'invalid_url' };
+  }
+
+  if (!['https:', 'http:'].includes(parsed.protocol)) {
+    return { upstream: null, ok: false, reason: 'invalid_protocol' };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (!ALLOWED_UPSTREAM_HOSTS.has(hostname)) {
+    return { upstream: null, ok: false, reason: `host_not_allowed:${hostname}` };
+  }
+
+  parsed.pathname = parsed.pathname.replace(/\/$/, '');
+  const safeUpstream = parsed.origin + parsed.pathname;
+  return { upstream: safeUpstream, ok: true };
 }
 
 // --- HTTP helper ---
@@ -390,6 +417,11 @@ function makeRequest(url, options, body) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.request(url, options, resolve);
+
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      req.destroy(new Error(`Upstream timeout after ${REQUEST_TIMEOUT_MS}ms`));
+    });
+
     req.on('error', reject);
     if (body) req.write(body);
     req.end();
@@ -523,16 +555,31 @@ async function handleRequest(req, res) {
 
   const { upstream, ok } = parseUpstream(req.url);
   if (!ok) {
-    res.writeHead(400);
-    return res.end(JSON.stringify({ error: { message: 'Invalid path. Use: /<upstream-base>/v1/chat/completions' } }));
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      error: {
+        message: 'Invalid path. Use: /<upstream-base>/v1/chat/completions and allowed host list',
+        code: 'INVALID_UPSTREAM_PATH',
+      },
+    }));
   }
 
   const bodyChunks = [];
   for await (const chunk of req) bodyChunks.push(chunk);
   let body;
   try { body = JSON.parse(Buffer.concat(bodyChunks).toString()); } catch {
-    res.writeHead(400);
-    return res.end('Invalid JSON');
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: { message: 'Invalid JSON body', code: 'INVALID_JSON' } }));
+  }
+
+  if (!body || typeof body !== 'object' || !body.model || !Array.isArray(body.messages)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      error: {
+        message: 'Body must include model(string) and messages(array)',
+        code: 'INVALID_REQUEST_BODY',
+      },
+    }));
   }
 
   const upstreamUrl = upstream.replace(/\/$/, '') + '/v1/responses';
@@ -566,9 +613,19 @@ async function handleRequest(req, res) {
       const errChunks = [];
       for await (const c of upRes) errChunks.push(c);
       const errBody = Buffer.concat(errChunks).toString();
-      console.error(`[ERR] ${upRes.statusCode} from ${upstream}: ${errBody.slice(0, 500)}`);
-      res.writeHead(upRes.statusCode, { 'Content-Type': 'application/json' });
-      return res.end(errBody);
+      const status = upRes.statusCode || 502;
+      console.error(`[ERR] ${status} from ${upstream}: ${errBody.slice(0, 500)}`);
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      if (errBody && errBody.trim()) {
+        return res.end(errBody);
+      }
+      return res.end(JSON.stringify({
+        error: {
+          message: 'Upstream returned non-200 without body',
+          code: 'UPSTREAM_BAD_STATUS',
+          status,
+        },
+      }));
     }
 
     if (isStream) {
@@ -661,8 +718,13 @@ async function handleRequest(req, res) {
 
   } catch (err) {
     console.error(`[ERR] ${err.message}`);
-    if (!res.headersSent) res.writeHead(502);
-    res.end(JSON.stringify({ error: { message: err.message } }));
+    if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: {
+        message: err.message || 'Upstream request failed',
+        code: 'UPSTREAM_REQUEST_FAILED',
+      },
+    }));
   }
 }
 
