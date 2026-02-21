@@ -2,26 +2,25 @@ import http from 'node:http';
 import https from 'node:https';
 
 const PORT = process.env.PORT || 3088;
+const MAX_IDLE_MS = 120_000;
 
 // --- Conversion: Chat Completions request → Responses API request ---
 function completionsToResponses(body) {
-  const resp = { model: body.model, input: [] };
+  const resp = { model: body.model, input: [], store: false };
 
   if (body.messages) {
     for (const msg of body.messages) {
-      if (msg.role === 'system') {
+      if (msg.role === 'system' || msg.role === 'developer') {
         const text = typeof msg.content === 'string' ? msg.content
           : Array.isArray(msg.content) ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('') : '';
         resp.instructions = (resp.instructions || '') + text;
       } else if (msg.role === 'tool') {
-        // Tool results: convert to Responses API format
         resp.input.push({
           type: 'function_call_output',
           call_id: msg.tool_call_id || '',
           output: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
         });
       } else if (msg.role === 'assistant' && msg.tool_calls) {
-        // Assistant message with tool calls: emit function_call items
         if (msg.content) {
           resp.input.push({ role: 'assistant', content: typeof msg.content === 'string' ? msg.content : '' });
         }
@@ -61,6 +60,17 @@ function completionsToResponses(body) {
   if (body.top_p != null) resp.top_p = body.top_p;
   if (body.max_tokens != null) resp.max_output_tokens = body.max_tokens;
   if (body.max_completion_tokens != null) resp.max_output_tokens = body.max_completion_tokens;
+  if (body.frequency_penalty != null) resp.frequency_penalty = body.frequency_penalty;
+  if (body.presence_penalty != null) resp.presence_penalty = body.presence_penalty;
+  if (body.seed != null) resp.seed = body.seed;
+  if (body.stop) resp.stop = body.stop;
+
+  // Reasoning effort
+  if (body.reasoning_effort) {
+    resp.reasoning = { effort: body.reasoning_effort };
+  }
+
+  // Tools
   if (body.tools) {
     resp.tools = body.tools.map(t => {
       if (t.type === 'function' && t.function) {
@@ -69,12 +79,24 @@ function completionsToResponses(body) {
           name: t.function.name,
           description: t.function.description,
           parameters: t.function.parameters,
+          strict: t.function.strict,
         };
       }
       return t;
     });
   }
-  if (body.tool_choice) resp.tool_choice = body.tool_choice;
+
+  // Tool choice format conversion
+  if (body.tool_choice != null) {
+    if (typeof body.tool_choice === 'string') {
+      resp.tool_choice = body.tool_choice;
+    } else if (body.tool_choice?.type === 'function' && body.tool_choice?.function?.name) {
+      resp.tool_choice = { type: 'function', name: body.tool_choice.function.name };
+    } else {
+      resp.tool_choice = body.tool_choice;
+    }
+  }
+
   if (body.stream) resp.stream = body.stream;
 
   return resp;
@@ -87,6 +109,7 @@ function responsesToCompletions(respBody, model) {
   let outputContent = '';
   let toolCalls = [];
   let finishReason = 'stop';
+  let reasoningContent = null;
 
   if (respBody.output) {
     for (const item of respBody.output) {
@@ -101,12 +124,19 @@ function responsesToCompletions(respBody, model) {
           function: { name: item.name, arguments: item.arguments || '' },
         });
         finishReason = 'tool_calls';
+      } else if (item.type === 'reasoning') {
+        for (const c of (item.content || [])) {
+          if (c.type === 'reasoning_text') {
+            reasoningContent = (reasoningContent || '') + c.text;
+          }
+        }
       }
     }
   }
 
   const message = { role: 'assistant', content: outputContent || null };
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
+  if (reasoningContent) message.reasoning_content = reasoningContent;
 
   return {
     id: respBody.id || 'chatcmpl-proxy-' + Date.now(),
@@ -128,10 +158,11 @@ function createStreamState(model) {
     id: 'chatcmpl-proxy-' + Date.now(),
     created: Math.floor(Date.now() / 1000),
     model,
-    // Track multiple tool calls
-    toolCalls: [],        // { index, id, name, started }
+    toolCalls: [],
     currentToolIndex: -1,
     hasContent: false,
+    hasReasoning: false,
+    sentRole: false,
     finished: false,
   };
 }
@@ -146,9 +177,15 @@ function makeChunk(state, delta, finishReason = null) {
   };
 }
 
+function ensureRoleChunk(state, out) {
+  if (!state.sentRole) {
+    state.sentRole = true;
+    out.push(makeChunk(state, { role: 'assistant', content: '' }));
+  }
+}
+
 // --- Streaming conversion ---
 function convertStreamChunk(line, state) {
-  // Handle event: lines (just skip, we parse from data:)
   if (line.startsWith('event:')) return null;
   if (!line.startsWith('data:')) return null;
 
@@ -158,26 +195,38 @@ function convertStreamChunk(line, state) {
   let event;
   try { event = JSON.parse(data); } catch { return null; }
 
-  // Already in Chat Completions format — pass through
   if (event.object === 'chat.completion.chunk') return `data: ${data}\n\n`;
 
   const out = [];
 
   switch (event.type) {
+    // --- Reasoning ---
+    case 'response.reasoning.delta':
+    case 'response.reasoning_summary_text.delta': {
+      state.hasReasoning = true;
+      ensureRoleChunk(state, out);
+      if (event.delta) {
+        out.push(makeChunk(state, { reasoning_content: event.delta }));
+      }
+      break;
+    }
+
+    case 'response.reasoning.done':
+    case 'response.reasoning_summary_text.done':
+      break;
+
     // --- Text output ---
     case 'response.output_text.delta': {
       if (!state.hasContent) {
         state.hasContent = true;
-        out.push(makeChunk(state, { role: 'assistant', content: '' }));
+        ensureRoleChunk(state, out);
       }
       out.push(makeChunk(state, { content: event.delta || '' }));
       break;
     }
 
-    case 'response.output_text.done': {
-      // Final text — no action needed, we streamed deltas
+    case 'response.output_text.done':
       break;
-    }
 
     // --- Function/tool calls ---
     case 'response.output_item.added': {
@@ -191,43 +240,38 @@ function convertStreamChunk(line, state) {
         };
         state.toolCalls.push(tc);
         state.currentToolIndex = idx;
-        console.log(`[STREAM] tool_call added: index=${idx} name=${tc.name} id=${tc.id}`);
+        console.log(`[STREAM] tool_call added: idx=${idx} name=${tc.name} id=${tc.id}`);
       }
       break;
     }
 
     case 'response.function_call_arguments.delta': {
-      const tc = state.toolCalls[state.currentToolIndex];
+      let tc = state.toolCalls[state.currentToolIndex];
       if (!tc) {
-        // No output_item.added received — create one on the fly
         const idx = state.toolCalls.length;
-        const newTc = {
+        tc = {
           index: idx,
           id: event.call_id || event.item_id || 'call_' + Date.now() + '_' + idx,
           name: event.name || '',
           started: false,
         };
-        state.toolCalls.push(newTc);
+        state.toolCalls.push(tc);
         state.currentToolIndex = idx;
       }
 
-      const activeTc = state.toolCalls[state.currentToolIndex];
-      if (!activeTc.started) {
-        activeTc.started = true;
-        // Emit the tool call header
+      if (!tc.started) {
+        tc.started = true;
         out.push(makeChunk(state, {
+          role: 'assistant',
           tool_calls: [{
-            index: activeTc.index,
-            id: activeTc.id,
-            type: 'function',
-            function: { name: activeTc.name, arguments: '' },
+            index: tc.index, id: tc.id, type: 'function',
+            function: { name: tc.name, arguments: '' },
           }],
         }));
       }
-      // Emit argument delta
       out.push(makeChunk(state, {
         tool_calls: [{
-          index: activeTc.index,
+          index: tc.index,
           function: { arguments: event.delta || '' },
         }],
       }));
@@ -237,18 +281,16 @@ function convertStreamChunk(line, state) {
     case 'response.function_call_arguments.done': {
       const tc = state.toolCalls[state.currentToolIndex];
       if (tc && !tc.started) {
-        // Edge case: got done without any delta — emit full call at once
         tc.started = true;
         out.push(makeChunk(state, {
+          role: 'assistant',
           tool_calls: [{
-            index: tc.index,
-            id: tc.id,
-            type: 'function',
+            index: tc.index, id: tc.id, type: 'function',
             function: { name: tc.name, arguments: event.arguments || '' },
           }],
         }));
       }
-      console.log(`[STREAM] tool_call args done: index=${state.currentToolIndex}`);
+      console.log(`[STREAM] tool_call args done: idx=${state.currentToolIndex}`);
       break;
     }
 
@@ -257,52 +299,43 @@ function convertStreamChunk(line, state) {
     case 'response.done': {
       if (!state.finished) {
         state.finished = true;
-        const finishReason = state.toolCalls.length > 0 ? 'tool_calls' : 'stop';
-        out.push(makeChunk(state, {}, finishReason));
-        console.log(`[STREAM] response done, finish_reason=${finishReason}`);
-      }
-      break;
-    }
-
-    // --- Error from upstream ---
-    case 'error': {
-      console.error(`[STREAM-UPSTREAM-ERR] ${JSON.stringify(event.error || event)}`);
-      // Send what we have and close
-      if (!state.finished) {
-        state.finished = true;
         const fr = state.toolCalls.length > 0 ? 'tool_calls' : 'stop';
         out.push(makeChunk(state, {}, fr));
+        console.log(`[STREAM] done: finish_reason=${fr} tools=${state.toolCalls.length}`);
       }
       break;
     }
 
-    default: {
-      // Log unhandled event types for debugging
-      if (event.type) {
-        console.log(`[STREAM] unhandled event.type=${event.type}`);
+    case 'error': {
+      console.error(`[STREAM-ERR] ${JSON.stringify(event.error || event)}`);
+      if (!state.finished) {
+        state.finished = true;
+        out.push(makeChunk(state, {}, state.toolCalls.length > 0 ? 'tool_calls' : 'stop'));
       }
       break;
     }
+
+    default:
+      if (event.type) console.log(`[STREAM] unhandled: ${event.type}`);
+      break;
   }
 
   if (out.length === 0) return null;
   return out.map(c => `data: ${JSON.stringify(c)}\n\n`).join('');
 }
 
-// --- Parse upstream URL from request path ---
+// --- Parse upstream URL ---
 function parseUpstream(url) {
   const path = url.split('?')[0];
   const match = path.match(/^\/(https?:\/\/.+?)\/(?:v1\/)?chat\/completions$/);
   if (match) return { upstream: match[1], ok: true };
-
   const decoded = decodeURIComponent(path);
   const match2 = decoded.match(/^\/(https?:\/\/.+?)\/(?:v1\/)?chat\/completions$/);
   if (match2) return { upstream: match2[1], ok: true };
-
   return { upstream: null, ok: false };
 }
 
-// --- HTTP request helper ---
+// --- HTTP helper ---
 function makeRequest(url, options, body) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
@@ -313,14 +346,118 @@ function makeRequest(url, options, body) {
   });
 }
 
+// --- SSE → JSON assembly (non-streaming fallback) ---
+function assembleSSE(rawResp, requestModel) {
+  const lines = rawResp.split('\n');
+  let fullText = '';
+  let reasoningText = '';
+  let respId = '';
+  let respModel = requestModel;
+  let usage = null;
+  const tcMap = new Map();
+  const tcOrder = [];
+  let curCallId = '';
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (data === '[DONE]') break;
+    let ev;
+    try { ev = JSON.parse(data); } catch { continue; }
+
+    switch (ev.type) {
+      case 'response.output_text.delta':
+        fullText += ev.delta || '';
+        break;
+      case 'response.reasoning.delta':
+      case 'response.reasoning_summary_text.delta':
+        reasoningText += ev.delta || '';
+        break;
+      case 'response.output_item.added':
+        if (ev.item?.type === 'function_call') {
+          curCallId = ev.item.call_id || ev.item.id || 'call_' + Date.now();
+          tcMap.set(curCallId, { name: ev.item.name || '', args: '' });
+          tcOrder.push(curCallId);
+        }
+        break;
+      case 'response.function_call_arguments.delta': {
+        const tc = tcMap.get(curCallId);
+        if (tc) tc.args += ev.delta || '';
+        break;
+      }
+      case 'response.function_call_arguments.done': {
+        const tc = tcMap.get(curCallId);
+        if (tc && ev.arguments) tc.args = ev.arguments;
+        break;
+      }
+      case 'response.completed':
+      case 'response.done':
+        if (ev.response) {
+          respId = ev.response.id || respId;
+          respModel = ev.response.model || respModel;
+          usage = ev.response.usage || usage;
+          if (ev.response.output) {
+            for (const item of ev.response.output) {
+              if (item.type === 'message') {
+                for (const c of (item.content || [])) {
+                  if (c.type === 'output_text' && !fullText) fullText += c.text;
+                }
+              } else if (item.type === 'function_call' && !tcMap.has(item.call_id)) {
+                const cid = item.call_id || item.id;
+                tcMap.set(cid, { name: item.name || '', args: item.arguments || '' });
+                tcOrder.push(cid);
+              }
+            }
+          }
+        }
+        break;
+      default:
+        if (ev.output) {
+          for (const item of ev.output) {
+            if (item.type === 'message') {
+              for (const c of (item.content || [])) {
+                if (c.type === 'output_text') fullText += c.text;
+              }
+            }
+          }
+        }
+        break;
+    }
+  }
+
+  const toolCalls = tcOrder.map(cid => {
+    const tc = tcMap.get(cid);
+    return { id: cid, type: 'function', function: { name: tc.name, arguments: tc.args } };
+  });
+
+  const fr = toolCalls.length > 0 ? 'tool_calls' : 'stop';
+  const message = { role: 'assistant', content: fullText || null };
+  if (toolCalls.length > 0) message.tool_calls = toolCalls;
+  if (reasoningText) message.reasoning_content = reasoningText;
+
+  console.log(`[OK] SSE→JSON: text=${fullText.length} reasoning=${reasoningText.length} tools=${toolCalls.length}`);
+
+  return {
+    id: respId || 'chatcmpl-proxy-' + Date.now(),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: respModel,
+    choices: [{ index: 0, message, finish_reason: fr }],
+    usage: usage ? {
+      prompt_tokens: usage.input_tokens || 0,
+      completion_tokens: usage.output_tokens || 0,
+      total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+    } : undefined,
+  };
+}
+
 // --- Main handler ---
 async function handleRequest(req, res) {
   if (req.url === '/health') {
     res.writeHead(200);
     return res.end('ok');
   }
-
-  console.log(`[REQ] ${req.method} ${req.url}`);
 
   if (req.method !== 'POST') {
     res.writeHead(405);
@@ -330,9 +467,7 @@ async function handleRequest(req, res) {
   const { upstream, ok } = parseUpstream(req.url);
   if (!ok) {
     res.writeHead(400);
-    return res.end(JSON.stringify({
-      error: { message: 'Invalid path. Use: /<upstream-base>/v1/chat/completions' }
-    }));
+    return res.end(JSON.stringify({ error: { message: 'Invalid path. Use: /<upstream-base>/v1/chat/completions' } }));
   }
 
   const bodyChunks = [];
@@ -347,8 +482,12 @@ async function handleRequest(req, res) {
   const responsesBody = completionsToResponses(body);
   const responsesJson = JSON.stringify(responsesBody);
   const isStream = body.stream;
+  const ts = new Date().toISOString();
 
-  console.log(`[${new Date().toISOString()}] ${upstream} model=${body.model} stream=${!!isStream} tools=${(body.tools||[]).length}`);
+  const toolCount = (body.tools || []).length;
+  const msgCount = (body.messages || []).length;
+  const hasToolResults = (body.messages || []).some(m => m.role === 'tool');
+  console.log(`[${ts}] ${upstream} model=${body.model} stream=${!!isStream} tools=${toolCount} msgs=${msgCount} toolResults=${hasToolResults}`);
 
   try {
     const upRes = await makeRequest(upstreamUrl, {
@@ -364,7 +503,7 @@ async function handleRequest(req, res) {
       const errChunks = [];
       for await (const c of upRes) errChunks.push(c);
       const errBody = Buffer.concat(errChunks).toString();
-      console.log(`[ERR] ${upRes.statusCode}: ${errBody.slice(0, 500)}`);
+      console.error(`[ERR] ${upRes.statusCode} from ${upstream}: ${errBody.slice(0, 500)}`);
       res.writeHead(upRes.statusCode, { 'Content-Type': 'application/json' });
       return res.end(errBody);
     }
@@ -380,12 +519,10 @@ async function handleRequest(req, res) {
       let buffer = '';
       let lastData = Date.now();
 
-      // Safety timeout: 90s idle → force close
       const idleCheck = setInterval(() => {
-        if (Date.now() - lastData > 90000) {
-          console.warn(`[STREAM-TIMEOUT] No data for 90s, force closing`);
+        if (Date.now() - lastData > MAX_IDLE_MS) {
+          console.warn(`[STREAM-TIMEOUT] No data for ${MAX_IDLE_MS / 1000}s, force closing`);
           clearInterval(idleCheck);
-          // Emit a finish chunk if we haven't yet
           if (!state.finished) {
             state.finished = true;
             const fr = state.toolCalls.length > 0 ? 'tool_calls' : 'stop';
@@ -413,21 +550,17 @@ async function handleRequest(req, res) {
 
       upRes.on('end', () => {
         clearInterval(idleCheck);
-        // Flush remaining buffer
         if (buffer.trim()) {
           const converted = convertStreamChunk(buffer.trim(), state);
-          if (converted) {
-            try { res.write(converted); } catch {}
-          }
+          if (converted) try { res.write(converted); } catch {}
         }
-        // Ensure we sent a finish chunk
         if (!state.finished) {
           state.finished = true;
           const fr = state.toolCalls.length > 0 ? 'tool_calls' : 'stop';
           try { res.write(`data: ${JSON.stringify(makeChunk(state, {}, fr))}\n\n`); } catch {}
         }
         try { res.write('data: [DONE]\n\n'); res.end(); } catch {}
-        console.log(`[STREAM-END] completed normally, tools=${state.toolCalls.length} hasContent=${state.hasContent}`);
+        console.log(`[STREAM-END] tools=${state.toolCalls.length} content=${state.hasContent} reasoning=${state.hasReasoning}`);
       });
 
       upRes.on('error', (err) => {
@@ -435,8 +568,7 @@ async function handleRequest(req, res) {
         console.error(`[STREAM-ERR] ${err.message}`);
         if (!state.finished) {
           state.finished = true;
-          const fr = state.toolCalls.length > 0 ? 'tool_calls' : 'stop';
-          try { res.write(`data: ${JSON.stringify(makeChunk(state, {}, fr))}\n\n`); } catch {}
+          try { res.write(`data: ${JSON.stringify(makeChunk(state, {}, 'stop'))}\n\n`); } catch {}
         }
         try { res.write('data: [DONE]\n\n'); res.end(); } catch {}
       });
@@ -447,82 +579,17 @@ async function handleRequest(req, res) {
       for await (const c of upRes) respChunks.push(c);
       const rawResp = Buffer.concat(respChunks).toString();
 
-      // Check if upstream returned SSE despite stream=false
       if (rawResp.trimStart().startsWith('event:') || rawResp.trimStart().startsWith('data:')) {
-        const lines = rawResp.split('\n');
-        let fullText = '';
-        let respId = '';
-        let respModel = body.model;
-        let usage = null;
-        let toolCalls = [];
-        let currentToolName = '';
-        let currentToolArgs = '';
-        let currentToolId = '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-          const data = trimmed.slice(5).trim();
-          if (data === '[DONE]') break;
-          let event;
-          try { event = JSON.parse(data); } catch { continue; }
-
-          if (event.type === 'response.output_text.delta') {
-            fullText += event.delta || '';
-          } else if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
-            currentToolName = event.item.name || '';
-            currentToolId = event.item.call_id || event.item.id || '';
-          } else if (event.type === 'response.function_call_arguments.delta') {
-            currentToolArgs += event.delta || '';
-          } else if (event.type === 'response.function_call_arguments.done') {
-            toolCalls.push({
-              id: currentToolId || 'call_' + Date.now(),
-              type: 'function',
-              function: { name: currentToolName, arguments: currentToolArgs },
-            });
-            currentToolArgs = '';
-            currentToolName = '';
-            currentToolId = '';
-          } else if (event.type === 'response.completed' || event.type === 'response.done') {
-            if (event.response) {
-              respId = event.response.id || respId;
-              respModel = event.response.model || respModel;
-              usage = event.response.usage || usage;
-            }
-          }
-          if (event.output) {
-            for (const item of event.output) {
-              if (item.type === 'message') {
-                for (const c of (item.content || [])) {
-                  if (c.type === 'output_text') fullText += c.text;
-                }
-              }
-            }
-          }
-        }
-
-        const message = { role: 'assistant', content: fullText || null };
-        const finishReason = toolCalls.length > 0 ? 'tool_calls' : 'stop';
-        if (toolCalls.length > 0) message.tool_calls = toolCalls;
-
-        const result = {
-          id: respId || 'chatcmpl-proxy-' + Date.now(),
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: respModel,
-          choices: [{ index: 0, message, finish_reason: finishReason }],
-          usage: usage ? {
-            prompt_tokens: usage.input_tokens || 0,
-            completion_tokens: usage.output_tokens || 0,
-            total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
-          } : undefined,
-        };
-
-        console.log(`[OK] SSE→JSON assembled, text=${fullText.length} tools=${toolCalls.length}`);
+        const result = assembleSSE(rawResp, body.model);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } else {
-        const respBody = JSON.parse(rawResp);
+        let respBody;
+        try { respBody = JSON.parse(rawResp); } catch {
+          console.error(`[ERR] Failed to parse upstream response: ${rawResp.slice(0, 200)}`);
+          res.writeHead(502);
+          return res.end(JSON.stringify({ error: { message: 'Invalid upstream response' } }));
+        }
         const result = responsesToCompletions(respBody, body.model);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -530,7 +597,7 @@ async function handleRequest(req, res) {
     }
 
   } catch (err) {
-    console.error('[ERR]', err.message);
+    console.error(`[ERR] ${err.message}`);
     if (!res.headersSent) res.writeHead(502);
     res.end(JSON.stringify({ error: { message: err.message } }));
   }
