@@ -4,6 +4,16 @@ import https from 'node:https';
 const PORT = process.env.PORT || 3088;
 const MAX_IDLE_MS = 120_000;
 
+function makeId(prefix = 'id') {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function toToolArgsString(args) {
+  if (typeof args === 'string') return args;
+  if (args == null) return '';
+  try { return JSON.stringify(args); } catch { return String(args); }
+}
+
 // --- Conversion: Chat Completions request → Responses API request ---
 function completionsToResponses(body) {
   const resp = { model: body.model, input: [], store: false };
@@ -28,7 +38,7 @@ function completionsToResponses(body) {
           resp.input.push({
             type: 'function_call',
             name: tc.function?.name || '',
-            arguments: tc.function?.arguments || '',
+            arguments: toToolArgsString(tc.function?.arguments),
             call_id: tc.id || '',
           });
         }
@@ -104,28 +114,41 @@ function completionsToResponses(body) {
 
 // --- Conversion: Responses API response → Chat Completions response ---
 function responsesToCompletions(respBody, model) {
+  if (!respBody || typeof respBody !== 'object') {
+    return {
+      id: makeId('chatcmpl-proxy'),
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: model || 'unknown',
+      choices: [{ index: 0, message: { role: 'assistant', content: null }, finish_reason: 'stop' }],
+    };
+  }
+
   if (respBody.object === 'chat.completion' || respBody.choices) return respBody;
 
   let outputContent = '';
-  let toolCalls = [];
+  const toolCalls = [];
   let finishReason = 'stop';
   let reasoningContent = null;
 
-  if (respBody.output) {
+  if (Array.isArray(respBody.output)) {
     for (const item of respBody.output) {
       if (item.type === 'message') {
-        for (const c of (item.content || [])) {
+        for (const c of (Array.isArray(item.content) ? item.content : [])) {
           if (c.type === 'output_text') outputContent += c.text;
         }
       } else if (item.type === 'function_call') {
         toolCalls.push({
-          id: item.call_id || item.id,
+          id: item.call_id || item.id || makeId('call'),
           type: 'function',
-          function: { name: item.name, arguments: item.arguments || '' },
+          function: {
+            name: item.name || '',
+            arguments: toToolArgsString(item.arguments),
+          },
         });
         finishReason = 'tool_calls';
       } else if (item.type === 'reasoning') {
-        for (const c of (item.content || [])) {
+        for (const c of (Array.isArray(item.content) ? item.content : [])) {
           if (c.type === 'reasoning_text') {
             reasoningContent = (reasoningContent || '') + c.text;
           }
@@ -138,24 +161,26 @@ function responsesToCompletions(respBody, model) {
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
   if (reasoningContent) message.reasoning_content = reasoningContent;
 
+  const usage = (respBody.usage && typeof respBody.usage === 'object') ? {
+    prompt_tokens: respBody.usage.input_tokens || 0,
+    completion_tokens: respBody.usage.output_tokens || 0,
+    total_tokens: (respBody.usage.input_tokens || 0) + (respBody.usage.output_tokens || 0),
+  } : undefined;
+
   return {
-    id: respBody.id || 'chatcmpl-proxy-' + Date.now(),
+    id: respBody.id || makeId('chatcmpl-proxy'),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model: model || respBody.model || 'unknown',
     choices: [{ index: 0, message, finish_reason: finishReason }],
-    usage: respBody.usage ? {
-      prompt_tokens: respBody.usage.input_tokens || 0,
-      completion_tokens: respBody.usage.output_tokens || 0,
-      total_tokens: (respBody.usage.input_tokens || 0) + (respBody.usage.output_tokens || 0),
-    } : undefined,
+    usage,
   };
 }
 
 // --- Streaming state ---
 function createStreamState(model) {
   return {
-    id: 'chatcmpl-proxy-' + Date.now(),
+    id: makeId('chatcmpl-proxy'),
     created: Math.floor(Date.now() / 1000),
     model,
     toolCalls: [],
@@ -234,7 +259,7 @@ function convertStreamChunk(line, state) {
         const idx = state.toolCalls.length;
         const tc = {
           index: idx,
-          id: event.item.call_id || event.item.id || 'call_' + Date.now() + '_' + idx,
+          id: event.item.call_id || event.item.id || makeId('call'),
           name: event.item.name || '',
           started: false,
         };
@@ -251,7 +276,7 @@ function convertStreamChunk(line, state) {
         const idx = state.toolCalls.length;
         tc = {
           index: idx,
-          id: event.call_id || event.item_id || 'call_' + Date.now() + '_' + idx,
+          id: event.call_id || event.item_id || makeId('call'),
           name: event.name || '',
           started: false,
         };
@@ -376,7 +401,7 @@ function assembleSSE(rawResp, requestModel) {
         break;
       case 'response.output_item.added':
         if (ev.item?.type === 'function_call') {
-          curCallId = ev.item.call_id || ev.item.id || 'call_' + Date.now();
+          curCallId = ev.item.call_id || ev.item.id || makeId('call');
           tcMap.set(curCallId, { name: ev.item.name || '', args: '' });
           tcOrder.push(curCallId);
         }
