@@ -1,0 +1,13 @@
+# === completions-proxy production env ===
+# listen port
+PORT=3088
+
+# upstream request timeout (ms)
+REQUEST_TIMEOUT_MS=90000
+
+# only these upstream hosts are allowed in proxy path
+# comma-separated list
+ALLOWED_UPSTREAM_HOSTS=api.infiniteai.cc
+
+# optional log file path
+PROXY_LOG=/tmp/proxy.log
