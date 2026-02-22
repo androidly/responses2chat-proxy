@@ -3,10 +3,10 @@ import https from 'node:https';
 
 const PORT = process.env.PORT || 3088;
 const MAX_IDLE_MS = 120_000;
-const REQUEST_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 90_000);
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || process.env.UPSTREAM_TIMEOUT_MS || 90_000);
 const SSE_KEEPALIVE_MS = 15_000; // send SSE comment every 15s to keep connection alive
 const ALLOWED_UPSTREAM_HOSTS = new Set(
-  String(process.env.ALLOWED_UPSTREAM_HOSTS || 'api.infiniteai.cc')
+  String(process.env.ALLOWED_UPSTREAM_HOSTS || 'api.example.com')
     .split(',')
     .map(s => s.trim().toLowerCase())
     .filter(Boolean),
