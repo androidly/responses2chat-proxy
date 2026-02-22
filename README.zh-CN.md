@@ -43,6 +43,44 @@ node proxy.mjs
 curl -s http://localhost:3088/health
 ```
 
+## 怎么用（重点）
+
+代理要求请求路径是下面这种格式：
+
+```text
+POST http://127.0.0.1:3088/<上游-base>/v1/chat/completions
+```
+
+其中 `<上游-base>` 是你真实上游的 origin（可带前缀路径），例如：
+
+- `https://api.example.com`
+- `https://api.example.com/openai`
+
+### cURL 示例
+
+```bash
+curl -s http://127.0.0.1:3088/https://api.example.com/v1/chat/completions \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.3-codex",
+    "messages": [{"role":"user","content":"你好"}],
+    "stream": false
+  }'
+```
+
+### 客户端 baseURL 写法
+
+如果你的 SDK 会自动补 `.../chat/completions`，就用：
+
+- `http://127.0.0.1:3088/https://api.example.com`
+
+如果你的 SDK 固定补 `.../v1/chat/completions`，就用：
+
+- `http://127.0.0.1:3088/https://api.example.com/v1`
+
+两种都要保证：API Key 放在调用方请求头 `Authorization` 里。
+
 ## 生产运行
 
 ```bash
@@ -54,7 +92,8 @@ nohup ./start-prod.sh >/tmp/proxy-launch.log 2>&1 &
 
 - `PORT`（默认：`3088`）
 - `REQUEST_TIMEOUT_MS`（默认：`90000`）
-- `ALLOWED_UPSTREAM_HOSTS`（默认：`api.infiniteai.cc`）
+- `UPSTREAM_TIMEOUT_MS`（兼容旧变量，可选）
+- `ALLOWED_UPSTREAM_HOSTS`（默认：`api.example.com`）
 - `PROXY_LOG`（默认：`/tmp/proxy.log`）
 
 ## 运行回归测试

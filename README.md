@@ -42,6 +42,44 @@ Health check:
 curl -s http://localhost:3088/health
 ```
 
+## How to Use (important)
+
+The proxy expects this request path format:
+
+```text
+POST http://127.0.0.1:3088/<upstream-base>/v1/chat/completions
+```
+
+Where `<upstream-base>` is your real upstream origin, for example:
+
+- `https://api.example.com`
+- `https://api.example.com/openai`
+
+### cURL example
+
+```bash
+curl -s http://127.0.0.1:3088/https://api.example.com/v1/chat/completions \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.3-codex",
+    "messages": [{"role":"user","content":"hello"}],
+    "stream": false
+  }'
+```
+
+### Client `baseURL` examples
+
+If your SDK sends `.../chat/completions`, use:
+
+- `http://127.0.0.1:3088/https://api.example.com`
+
+If your SDK forces `.../v1/chat/completions`, use:
+
+- `http://127.0.0.1:3088/https://api.example.com/v1`
+
+In both cases, keep API key in the caller-side `Authorization` header.
+
 ## Production Run
 
 ```bash
@@ -53,7 +91,8 @@ nohup ./start-prod.sh >/tmp/proxy-launch.log 2>&1 &
 
 - `PORT` (default: `3088`)
 - `REQUEST_TIMEOUT_MS` (default: `90000`)
-- `ALLOWED_UPSTREAM_HOSTS` (default: `api.infiniteai.cc`)
+- `UPSTREAM_TIMEOUT_MS` (legacy alias; optional)
+- `ALLOWED_UPSTREAM_HOSTS` (default: `api.example.com`)
 - `PROXY_LOG` (default: `/tmp/proxy.log`)
 
 ## Run Regression Tests
@@ -65,7 +104,7 @@ node tests/proxy-regression.mjs
 ## Security Notes
 
 - Only upstream hosts in `ALLOWED_UPSTREAM_HOSTS` are permitted.
-- Keep API keys in caller-side Authorization headers; do not hardcode keys into this repository.
+- Keep API keys in caller-side `Authorization` headers; do not hardcode keys into this repository.
 
 ## Roadmap
 

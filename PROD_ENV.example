@@ -3,11 +3,12 @@
 PORT=3088
 
 # upstream request timeout (ms)
+# (also accepts legacy name: UPSTREAM_TIMEOUT_MS)
 REQUEST_TIMEOUT_MS=90000
 
 # only these upstream hosts are allowed in proxy path
 # comma-separated list
-ALLOWED_UPSTREAM_HOSTS=api.infiniteai.cc
+ALLOWED_UPSTREAM_HOSTS=api.example.com
 
 # optional log file path
 PROXY_LOG=/tmp/proxy.log
