@@ -81,6 +81,40 @@ curl -s http://127.0.0.1:3088/https://api.example.com/v1/chat/completions \
 
 两种都要保证：API Key 放在调用方请求头 `Authorization` 里。
 
+## OpenClaw 配置示例
+
+OpenClaw 的 `openai-completions` 适配器会请求：
+
+```text
+<baseUrl>/chat/completions
+```
+
+因此在 OpenClaw 里，`baseUrl` 建议写成（注意结尾 `/v1`）：
+
+```json
+{
+  "models": {
+    "providers": {
+      "myproxy": {
+        "baseUrl": "http://127.0.0.1:3088/https://api.example.com/v1",
+        "apiKey": "<YOUR_API_KEY>",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "gpt-5.3-codex",
+            "name": "GPT-5.3 Codex",
+            "input": ["text", "image"]
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+> 如果你把 `baseUrl` 写成 `http://127.0.0.1:3088/https://api.example.com`（不带 `/v1`），
+> OpenClaw 最终会打到 `.../chat/completions`，这通常与大多数上游期望的 `/v1/chat/completions` 不一致。
+
 ## 生产运行
 
 ```bash

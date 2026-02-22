@@ -80,6 +80,40 @@ If your SDK forces `.../v1/chat/completions`, use:
 
 In both cases, keep API key in the caller-side `Authorization` header.
 
+## OpenClaw Configuration Example
+
+OpenClaw `openai-completions` adapter calls:
+
+```text
+<baseUrl>/chat/completions
+```
+
+So in OpenClaw, set `baseUrl` with trailing `/v1`:
+
+```json
+{
+  "models": {
+    "providers": {
+      "myproxy": {
+        "baseUrl": "http://127.0.0.1:3088/https://api.example.com/v1",
+        "apiKey": "<YOUR_API_KEY>",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "gpt-5.3-codex",
+            "name": "GPT-5.3 Codex",
+            "input": ["text", "image"]
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+> If `baseUrl` is set to `http://127.0.0.1:3088/https://api.example.com` (without `/v1`),
+> OpenClaw will hit `.../chat/completions`, which usually does not match providers expecting `/v1/chat/completions`.
+
 ## Production Run
 
 ```bash
